@@ -19,6 +19,8 @@ To run this code, you need to specify the `WIDER_DATA_DIR` (WIDER dataset "Image
 
 Select the checkpoint with the best mAP.
 
+You can also evaluate the predictions with code at: https://github.com/zhufengx/SRN_multilabel, which would produce a slightly better (~0.1\%) performance.
+
 ## Datasets
 
 1. WIDER Attribute Dataset: http://mmlab.ie.cuhk.edu.hk/projects/WIDERAttribute.html
