@@ -2,14 +2,16 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
+from torch.autograd import Variable
 
 import torchvision
 import torchvision.transforms as transforms
 import torchvision.models as models
 
-from torch.autograd import Variable
-from wider import get_subsets
 from test import test
+from configs import get_configs
+from utils import get_dataset, adjust_learning_rate, SigmoidCrossEntropyLoss, \
+	generate_flip_grid
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -21,127 +23,81 @@ import time
 import os
 
 
-parser = argparse.ArgumentParser(description = 'Attribute')
+def get_parser():
+	parser = argparse.ArgumentParser(description = 'CNN Attention Consistency')
+	parser.add_argument("--dataset", default="wider", type=str,
+		help="select a dataset to train models")
+	parser.add_argument("--arch", default="resnet50", type=str,
+		help="ResNet architecture")
 
-parser.add_argument('--data_dir',
-	default = '/path/to/WIDER/dataset/<Image>',
-	type = str,
-	help = 'path to "Image" folder of WIDER dataset')
-parser.add_argument('--anno_dir',
-	default = '/path/to/wider_attribute_annotation',
-	type = str,
-	help = 'annotation file')
+	parser.add_argument('--train_batch_size', default = 16, type = int,
+		help = 'default training batch size')
+	parser.add_argument('--train_workers', default = 4, type = int,
+		help = '# of workers used to load training samples')
+	parser.add_argument('--test_batch_size', default = 8, type = int,
+		help = 'default test batch size')
+	parser.add_argument('--test_workers', default = 4, type = int,
+		help = '# of workers used to load testing samples')
 
-parser.add_argument('--train_batch_size', default = 16, type = int,
-	help = 'default training batch size')
-parser.add_argument('--train_workers', default = 4, type = int,
-	help = '# of workers used to load training samples')
-parser.add_argument('--test_batch_size', default = 8, type = int,
-	help = 'default test batch size')
-parser.add_argument('--test_workers', default = 4, type = int,
-	help = '# of workers used to load testing samples')
+	parser.add_argument('--learning_rate', default = 0.001, type = float,
+		help = 'base learning rate')
+	parser.add_argument('--momentum', default = 0.9, type = float,
+		help = "set the momentum")
+	parser.add_argument('--weight_decay', default = 0.0005, type = float,
+		help = 'set the weight_decay')
+	parser.add_argument('--stepsize', default = 3, type = int,
+		help = 'lr decay each # of epoches')
+	parser.add_argument('--decay', default=0.5, type=float,
+		help = 'update learning rate by a factor')
 
-parser.add_argument('--learning_rate', default = 0.001, type = float,
-	help = 'base learning rate')
-parser.add_argument('--momentum', default = 0.9, type = float,
-	help = "set the momentum")
-parser.add_argument('--weight_decay', default = 0.0005, type = float,
-	help = 'set the weight_decay')
-parser.add_argument('--stepsize', default = 3, type = int,
-	help = 'lr decay each # of epoches')
+	parser.add_argument('--model_dir',
+		default = '/Storage/models/tmp',
+		type = str,
+		help = 'path to save checkpoints')
+	parser.add_argument('--model_prefix',
+		default = 'model',
+		type = str,
+		help = 'model file name starts with')
 
-parser.add_argument('--model_dir',
-	default = '/path/to/model/saving/dir',
-	type = str,
-	help = 'path to save checkpoints')
-parser.add_argument('--model_prefix',
-	default = 'model',
-	type = str,
-	help = 'model file name starts with')
+	# optimizer
+	parser.add_argument('--optimizer',
+		default = 'SGD',
+		type = str,
+		help = 'Select an optimizer: TBD')
 
-# optimizer
-parser.add_argument('--optimizer',
-	default = 'SGD',
-	type = str,
-	help = 'Select an optimizer: TBD')
+	# general parameters
+	parser.add_argument('--epoch_max', default = 12, type = int,
+		help = 'max # of epcoh')
+	parser.add_argument('--display', default = 200, type = int,
+		help = 'display')
+	parser.add_argument('--snapshot', default = 1, type = int,
+		help = 'snapshot')
+	parser.add_argument('--start_epoch', default = 0, type = int,
+		help = 'resume training from specified epoch')
+	parser.add_argument('--resume', default = '', type = str,
+		help = 'resume training from specified model state')
 
+	parser.add_argument('--test', default = True, type = bool,
+		help = 'conduct testing after each checkpoint being saved')
 
-# general parameters
-parser.add_argument('--epoch_max', default = 12, type = int,
-	help = 'max # of epcoh')
-parser.add_argument('--display', default = 200, type = int,
-	help = 'display')
-parser.add_argument('--snapshot', default = 1, type = int,
-	help = 'snapshot')
-parser.add_argument('--start_epoch', default = 0, type = int,
-	help = 'resume training from specified epoch')
-parser.add_argument('--resume', default = '', type = str,
-	help = 'resume training from specified model state')
-
-parser.add_argument('--test', default = True, type = bool,
-	help = 'conduct testing after each checkpoint being saved')
-
-# pre-calculated weights to balance positive and negative samples of each label
-pos_ratio = [0.5669, 0.2244, 0.0502, 0.2260, 0.2191, 0.4647, 0.0699, 0.1542, \
-	0.0816, 0.3621, 0.1005, 0.0330, 0.2682, 0.0543]
-pos_ratio = torch.FloatTensor(pos_ratio)
-w_p = (1 - pos_ratio).exp().cuda()
-w_n = pos_ratio.exp().cuda()
-
-
-def adjust_learning_rate(optimizer, epoch, stepsize):
-	"""Sets the learning rate to the initial LR decayed by 2 every 30 epochs"""
-	lr = args.learning_rate * (0.5 ** (epoch // stepsize))
-	print("Current learning rate is: {:.5f}".format(lr))
-	for param_group in optimizer.param_groups:
-		param_group['lr'] = lr
-
-
-def SigmoidCrossEntropyLoss(x, y):
-	# weighted sigmoid cross entropy loss defined in Li et al. ACPR'15
-	loss = 0.0
-	if not x.size() == y.size():
-		print("x and y must have the same size")
-	else:
-		N = y.size(0)
-		L = y.size(1)
-		for i in range(N):
-			w = torch.zeros(L).cuda()
-			w[y[i].data == 1] = w_p[y[i].data == 1]
-			w[y[i].data == 0] = w_n[y[i].data == 0]
-
-			w = Variable(w, requires_grad = False)
-			temp = - w * ( y[i] * (1 / (1 + (-x[i]).exp())).log() + \
-				(1 - y[i]) * ( (-x[i]).exp() / (1 + (-x[i]).exp()) ).log() )
-			loss += temp.sum()
-
-		loss = loss / N
-	return loss
-
-
-def generate_flip_grid(w, h):
-	# used to flip attention maps
-	x_ = torch.arange(w).view(1, -1).expand(h, -1)
-	y_ = torch.arange(h).view(-1, 1).expand(-1, w)
-	grid = torch.stack([x_, y_], dim=0).float().cuda()
-	grid = grid.unsqueeze(0).expand(1, -1, -1, -1)
-	grid[:, 0, :, :] = 2 * grid[:, 0, :, :] / (w - 1) - 1
-	grid[:, 1, :, :] = 2 * grid[:, 1, :, :] / (h - 1) - 1
-
-	grid[:, 0, :, :] = -grid[:, 0, :, :]
-	return grid
+	return parser
 
 
 def main():
-	global args
+	parser = get_parser()
+	print(parser)
 	args = parser.parse_args()
 	print(args)
 
 	# load data
-	data_dir = args.data_dir
-	anno_dir = args.anno_dir
+	opts = get_configs(args.dataset)
+	print(opts)
+	pos_ratio = torch.FloatTensor(opts["pos_ratio"])
+	w_p = (1 - pos_ratio).exp().cuda()
+	w_n = pos_ratio.exp().cuda()
 
-	trainset, testset = get_subsets(anno_dir, data_dir)
+	trainset, testset = get_dataset(opts)
+
 	train_loader = torch.utils.data.DataLoader(trainset,
 		batch_size = args.train_batch_size,
 		shuffle = True,
@@ -157,12 +113,21 @@ def main():
 		print("Make directory: " + args.model_dir)
 		os.makedirs(args.model_dir)
 
+	# prefix of saved checkpoint
 	model_prefix = args.model_dir + '/' + args.model_prefix
 
 
 	# define the model: use ResNet50 as an example
-	from resnet import resnet50
-	model = resnet50(pretrained = True)
+	if args.arch == "resnet50":
+		from resnet import resnet50
+		model = resnet50(pretrained=True, num_labels=opts["num_labels"])
+		model_prefix = model_prefix + "_resnet50"
+	elif args.arch == "resnet101":
+		from resnet import resnet101
+		model = resnet101(pretrained=True, num_labels=opts["num_labels"])
+		model_prefix = model_prefix + "_resnet101"
+	else:
+		raise NotImplementedError("To be implemented!")
 
 	if args.start_epoch != 0:
 		resume_model = torch.load(args.resume)
@@ -188,19 +153,22 @@ def main():
 			weight_decay = args.weight_decay
 		)
 	else:
-		pass
+		raise NotImplementedError("Not supported yet!")
 
 	# training the network
 	model.train()
 
 	# attention map size
-	w = 7
-	h = 7
-	grid_l = generate_flip_grid(w, h)
+	w1 = 7
+	h1 = 7
+	grid_l = generate_flip_grid(w1, h1)
 
-	w = 6
-	h = 6
-	grid_s = generate_flip_grid(w, h)
+	w2 = 6
+	h2 = 6
+	grid_s = generate_flip_grid(w2, h2)
+
+	# least common multiple
+	lcm = w1 * w2
 
 
 	criterion = SigmoidCrossEntropyLoss
@@ -208,7 +176,7 @@ def main():
 	for epoch in range(args.start_epoch, args.epoch_max):
 		epoch_start = time.clock()
 		if not args.stepsize == 0:
-			aedjust_learning_rate(optimizer, epoch, args.stepsize)
+			adjust_learning_rate(optimizer, epoch, args)
 		for step, batch_data in enumerate(train_loader):
 			batch_images_lo = batch_data[0]
 			batch_images_lf = batch_data[1]
@@ -234,7 +202,7 @@ def main():
 			output_s, hm_s = model(inputs_s)
 
 			output = torch.cat((output_l, output_s))
-			loss = criterion(output, labels)
+			loss = criterion(output, labels, w_p, w_n)
 
 			# flip
 			num = hm_l.size(0) // 2
@@ -257,8 +225,8 @@ def main():
 
 			# scale loss
 			num = hm_l.size(0)
-			hm_l = F.upsample(hm_l, 42)
-			hm_s = F.upsample(hm_s, 42)
+			hm_l = F.upsample(hm_l, lcm)
+			hm_s = F.upsample(hm_s, lcm)
 			scale_loss = F.mse_loss(hm_l, hm_s)
 
 			losses = loss + flip_loss_l + flip_loss_s + scale_loss
@@ -289,7 +257,7 @@ def main():
 		# test
 		if (epoch+1) % args.snapshot == 0:
 
-			model_file = model_prefix + '_resnet50_{}.pth'
+			model_file = model_prefix + '_epoch{}.pth'
 			print("Saving model to " + model_file.format(epoch+1))
 			torch.save(model, model_file.format(epoch+1))
 
@@ -301,7 +269,7 @@ def main():
 				print("test time: ", test_time)
 				model.train()
 
-	final_model =model_prefix + '_resnet50_final.pth'
+	final_model =model_prefix + '_final.pth'
 	print("Saving model to " + final_model)
 	torch.save(model, final_model)
 	model.eval()

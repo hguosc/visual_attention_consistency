@@ -18,8 +18,6 @@ model_urls = {
 	'resnet152': 'https://download.pytorch.org/models/resnet152-b121ed2d.pth',
 }
 
-num_attr = 14
-
 
 def conv3x3(in_planes, out_planes, stride=1):
 	"3x3 convolution with padding"
@@ -100,8 +98,9 @@ class Bottleneck(nn.Module):
 
 class ResNet(nn.Module):
 
-	def __init__(self, block, layers, num_classes=1000):
+	def __init__(self, block, layers, num_labels=14):
 		self.inplanes = 64
+		self.num_labels = num_labels
 		super(ResNet, self).__init__()
 		self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3,
 							   bias=False)
@@ -114,7 +113,7 @@ class ResNet(nn.Module):
 		self.layer4 = self._make_layer(block, 512, layers[3], stride=2)
 		self.avgpool = nn.AdaptiveAvgPool2d(1)
 
-		self.fc_all = nn.Linear(512 * block.expansion, num_attr)
+		self.fc_all = nn.Linear(512 * block.expansion, self.num_labels)
 
 		for m in self.modules():
 			if isinstance(m, nn.Conv2d):
@@ -163,13 +162,13 @@ class ResNet(nn.Module):
 		# get the FC parameters
 		params = list(self.parameters())
 		fc_weights = params[-2].data
-		fc_weights = fc_weights.view(1, num_attr, C, 1, 1)
+		fc_weights = fc_weights.view(1, self.num_labels, C, 1, 1)
 		fc_weights = Variable(fc_weights, requires_grad = False)
 
 		# attention
 		feat = feat.unsqueeze(1)	# N * 1 * C * H * W
 		hm = feat * fc_weights
-		hm = hm.sum(2)		# N * num_attr * H * W
+		hm = hm.sum(2)		# N * self.num_labels * H * W
 
 		heatmap = hm
 

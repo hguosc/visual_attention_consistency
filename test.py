@@ -217,6 +217,7 @@ if __name__ == '__main__':
 		shuffle = False,
 		num_workers = 4)
 
+	# modify to test multiple checkpoints continuously
 	for i in range(11, 12):
 		model_file = '/path/to/model_resnet50_{}.pth'.format(i)
 		model = torch.load(model_file)
